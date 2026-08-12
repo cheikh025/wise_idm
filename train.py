@@ -24,8 +24,10 @@ import time
 
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
+from torch.nn.parallel import DistributedDataParallel
+from torch.utils.data import DataLoader, DistributedSampler
 from torch.utils.tensorboard import SummaryWriter
 
 from droid_dataset import DroidIDMDataset
@@ -34,15 +36,36 @@ from model import DroidIDM
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
-def compute_joint_stats(ds: DroidIDMDataset) -> dict:
-    """Per-channel mean/std over the 7 joint-position targets only."""
-    actions = []
-    for i in range(len(ds)):
-        actions.append(ds[i]["action"][:, :7].numpy())
-    actions = np.concatenate(actions, axis=0)  # (N*chunk_len, 7)
-    mean = actions.mean(axis=0)
-    std = actions.std(axis=0) + 1e-6
-    return {"mean": mean.tolist(), "std": std.tolist()}
+def compute_stats_fast(ds: DroidIDMDataset) -> tuple[dict, float, int, int]:
+    """Joint mean/std + gripper pos/neg counts, read directly from the
+    already-loaded parquet action columns (ds.data / ds.windows) instead of
+    through ds[i] -- __getitem__ always decodes all 3 cameras' video for a
+    window even though only the 8-dim action column is needed here, which
+    made this pass over the full dataset (~40k+ windows at 5000-episode
+    scale) dominated by needless video I/O. Group-by-episode once, then
+    slice each window's action rows with numpy -- no video touched."""
+    per_episode = {}
+    for ep, g in ds.data.groupby("episode_index"):
+        g = g.sort_values("frame_index")
+        joints = np.stack(g["action.joint_position"].to_numpy())
+        gripper = g["action.gripper_position"].to_numpy().astype(np.float32)
+        per_episode[ep] = (joints, gripper)
+
+    all_joints, all_gripper = [], []
+    for w in ds.windows:
+        joints, gripper = per_episode[w.episode_index]
+        all_joints.append(joints[w.chunk_start:w.chunk_start + ds.chunk_len])
+        all_gripper.append(gripper[w.chunk_start:w.chunk_start + ds.chunk_len])
+    all_joints = np.concatenate(all_joints, axis=0)
+    all_gripper = np.concatenate(all_gripper, axis=0)
+
+    mean = all_joints.mean(axis=0)
+    std = all_joints.std(axis=0) + 1e-6
+    stats = {"mean": mean.tolist(), "std": std.tolist()}
+    pos = int((all_gripper > 0.5).sum())
+    neg = int((all_gripper <= 0.5).sum())
+    pos_weight = neg / max(pos, 1)
+    return stats, pos_weight, pos, neg
 
 
 def normalize_joints(joints: torch.Tensor, stats: dict, device) -> torch.Tensor:
@@ -62,20 +85,6 @@ def loss_fn(joints_pred_norm, gripper_logit_pred, joints_target_norm, gripper_ta
     gripper_loss = F.binary_cross_entropy_with_logits(
         gripper_logit_pred.squeeze(-1), gripper_target, pos_weight=gripper_pos_weight)
     return joint_loss + gripper_loss, joint_loss.item(), gripper_loss.item()
-
-
-def compute_gripper_pos_weight(ds: DroidIDMDataset, device) -> torch.Tensor:
-    """neg/pos ratio for BCEWithLogitsLoss's pos_weight, to counter the
-    measured 59%/29%/12% open/closed/mid class imbalance."""
-    vals = []
-    for i in range(len(ds)):
-        vals.append(ds[i]["action"][:, 7].numpy())
-    vals = np.concatenate(vals)
-    pos = (vals > 0.5).sum()
-    neg = (vals <= 0.5).sum()
-    w = neg / max(pos, 1)
-    print(f"gripper pos_weight: {w:.3f} (pos={pos}, neg={neg})")
-    return torch.tensor(w, device=device)
 
 
 def evaluate(model, loader, stats, device):
@@ -120,9 +129,10 @@ def main():
     p.add_argument("--train-episodes", type=int, nargs="+", default=list(range(22)))
     p.add_argument("--val-episodes", type=int, nargs="+", default=list(range(22, 27)))
     p.add_argument("--image-size", type=int, default=128)
-    p.add_argument("--batch-size", type=int, default=8)
+    p.add_argument("--batch-size", type=int, default=8, help="per-GPU batch size")
     p.add_argument("--epochs", type=int, default=20)
     p.add_argument("--lr", type=float, default=3e-4)
+    p.add_argument("--num-workers", type=int, default=4)
     p.add_argument("--out-dir", default="/workspace/wise_idm/checkpoints")
     p.add_argument("--log-dir", default="/workspace/wise_idm/tb_logs")
     p.add_argument("--seed", type=int, default=0)
@@ -133,36 +143,56 @@ def main():
     p.add_argument("--n-decoder-layers", type=int, default=4)
     a = p.parse_args()
 
+    # Multi-GPU via torchrun: LOCAL_RANK/WORLD_SIZE are set by the launcher,
+    # unset (defaulting to single-process) under a plain `python3 train.py`.
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    distributed = world_size > 1
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    if distributed:
+        dist.init_process_group(backend="nccl")
+        torch.cuda.set_device(local_rank)
+    device = torch.device(f"cuda:{local_rank}") if torch.cuda.is_available() else torch.device("cpu")
+    is_main = (not distributed) or dist.get_rank() == 0
+
     torch.manual_seed(a.seed)
-    os.makedirs(a.out_dir, exist_ok=True)
-    writer = SummaryWriter(a.log_dir)
+    if is_main:
+        os.makedirs(a.out_dir, exist_ok=True)
+    writer = SummaryWriter(a.log_dir) if is_main else None
 
     train_ds = DroidIDMDataset(episode_indices=a.train_episodes, image_size=a.image_size)
     val_ds = DroidIDMDataset(episode_indices=a.val_episodes, image_size=a.image_size)
-    print(f"train windows: {len(train_ds)}, val windows: {len(val_ds)}")
-
-    print("computing joint normalization stats from train split ...")
-    stats = compute_joint_stats(train_ds)
-    print("mean:", np.round(stats["mean"], 3))
-    print("std:", np.round(stats["std"], 3))
+    if is_main:
+        print(f"train windows: {len(train_ds)}, val windows: {len(val_ds)}, world_size={world_size}")
+        print("computing joint normalization stats + gripper pos_weight (parquet-only, no video decode) ...")
+    stats, pos_weight_val, pos, neg = compute_stats_fast(train_ds)
+    if is_main:
+        print("mean:", np.round(stats["mean"], 3))
+        print("std:", np.round(stats["std"], 3))
+        print(f"gripper pos_weight: {pos_weight_val:.3f} (pos={pos}, neg={neg})")
 
     model = DroidIDM(image_size=a.image_size, num_frames=train_ds.num_frames,
                       cnn_width=a.cnn_width, d_model=a.d_model, n_heads=a.n_heads,
-                      n_encoder_layers=a.n_encoder_layers, n_decoder_layers=a.n_decoder_layers).to(DEVICE)
+                      n_encoder_layers=a.n_encoder_layers, n_decoder_layers=a.n_decoder_layers).to(device)
     n_params = sum(p_.numel() for p_ in model.parameters())
-    print(f"model params: {n_params/1e6:.2f}M, spatial tokens: {model.num_spatial_tokens}")
+    if is_main:
+        print(f"model params: {n_params/1e6:.2f}M, spatial tokens: {model.num_spatial_tokens}")
+    if distributed:
+        # Broadcasts rank 0's initial weights to all ranks at construction,
+        # then all-reduces gradients each backward() so every rank's
+        # optimizer applies an identical update -- no manual param sync needed.
+        model = DistributedDataParallel(model, device_ids=[local_rank])
     opt = torch.optim.AdamW(model.parameters(), lr=a.lr, weight_decay=1e-4)
 
-    gripper_pos_weight = compute_gripper_pos_weight(train_ds, DEVICE) if a.mode == "train" else None
+    gripper_pos_weight = torch.tensor(pos_weight_val, device=device) if a.mode == "train" else None
 
     if a.mode == "overfit":
         loader = DataLoader(train_ds, batch_size=min(a.batch_size, len(train_ds)), shuffle=False)
         batch = next(iter(loader))
-        wrist, left, right = batch["wrist"].to(DEVICE), batch["left"].to(DEVICE), batch["right"].to(DEVICE)
-        proprio = batch["proprio"].to(DEVICE)
-        target = batch["action"].to(DEVICE)
+        wrist, left, right = batch["wrist"].to(device), batch["left"].to(device), batch["right"].to(device)
+        proprio = batch["proprio"].to(device)
+        target = batch["action"].to(device)
         joints_target, gripper_target = target[..., :7], target[..., 7]
-        joints_target_norm = normalize_joints(joints_target, stats, DEVICE)
+        joints_target_norm = normalize_joints(joints_target, stats, device)
 
         t0 = time.time()
         for step in range(300):
@@ -173,7 +203,7 @@ def main():
             loss.backward()
             opt.step()
             if step % 20 == 0 or step == 299:
-                joints_pred = denormalize_joints(joints_pred_norm, stats, DEVICE)
+                joints_pred = denormalize_joints(joints_pred_norm, stats, device)
                 joint_mae = (joints_pred - joints_target).abs().mean().item()
                 gripper_prob = torch.sigmoid(out["gripper_logit"].squeeze(-1))
                 gripper_acc = ((gripper_prob > 0.5).float() == (gripper_target > 0.5).float()).float().mean().item()
@@ -185,8 +215,17 @@ def main():
         print(f"overfit test done in {time.time()-t0:.1f}s")
         return
 
-    train_loader = DataLoader(train_ds, batch_size=a.batch_size, shuffle=True, num_workers=4, persistent_workers=True)
-    val_loader = DataLoader(val_ds, batch_size=a.batch_size, shuffle=False, num_workers=2, persistent_workers=True)
+    if distributed:
+        train_sampler = DistributedSampler(train_ds, shuffle=True, seed=a.seed)
+        train_loader = DataLoader(train_ds, batch_size=a.batch_size, sampler=train_sampler,
+                                   num_workers=a.num_workers, persistent_workers=True)
+    else:
+        train_sampler = None
+        train_loader = DataLoader(train_ds, batch_size=a.batch_size, shuffle=True,
+                                   num_workers=a.num_workers, persistent_workers=True)
+    val_loader = None
+    if is_main:
+        val_loader = DataLoader(val_ds, batch_size=a.batch_size, shuffle=False, num_workers=2, persistent_workers=True)
 
     total_steps = a.epochs * len(train_loader)
     warmup_steps = max(1, total_steps // 20)
@@ -198,15 +237,17 @@ def main():
     best_val_mae = float("inf")
     history = []
     for epoch in range(a.epochs):
+        if distributed:
+            train_sampler.set_epoch(epoch)
         t0 = time.time()
         epoch_loss = 0.0
         n_batches = 0
         for batch in train_loader:
-            wrist, left, right = batch["wrist"].to(DEVICE), batch["left"].to(DEVICE), batch["right"].to(DEVICE)
-            proprio = batch["proprio"].to(DEVICE)
-            target = batch["action"].to(DEVICE)
+            wrist, left, right = batch["wrist"].to(device), batch["left"].to(device), batch["right"].to(device)
+            proprio = batch["proprio"].to(device)
+            target = batch["action"].to(device)
             joints_target, gripper_target = target[..., :7], target[..., 7]
-            joints_target_norm = normalize_joints(joints_target, stats, DEVICE)
+            joints_target_norm = normalize_joints(joints_target, stats, device)
 
             opt.zero_grad()
             out = model(wrist, left, right, proprio)
@@ -219,41 +260,49 @@ def main():
 
             epoch_loss += loss.item()
             n_batches += 1
-            writer.add_scalar("train/loss", loss.item(), global_step)
-            writer.add_scalar("train/joint_loss", jl, global_step)
-            writer.add_scalar("train/gripper_bce", gl, global_step)
-            writer.add_scalar("train/lr", sched.get_last_lr()[0], global_step)
+            if is_main:
+                writer.add_scalar("train/loss", loss.item(), global_step)
+                writer.add_scalar("train/joint_loss", jl, global_step)
+                writer.add_scalar("train/gripper_bce", gl, global_step)
+                writer.add_scalar("train/lr", sched.get_last_lr()[0], global_step)
             global_step += 1
 
-        val_metrics = evaluate(model, val_loader, stats, DEVICE)
         epoch_time = time.time() - t0
-        print(f"epoch {epoch:3d}  train_loss={epoch_loss/n_batches:.5f}  "
-              f"val_mean_joint_mae={val_metrics['mean_joint_mae']:.5f}  "
-              f"val_gripper_acc={val_metrics['gripper_accuracy']:.3f}  ({epoch_time:.1f}s)")
-        writer.add_scalar("val/mean_joint_mae", val_metrics["mean_joint_mae"], epoch)
-        writer.add_scalar("val/gripper_accuracy", val_metrics["gripper_accuracy"], epoch)
-        history.append({"epoch": epoch, "train_loss": epoch_loss / n_batches, **val_metrics})
+        if is_main:
+            eval_model = model.module if distributed else model
+            val_metrics = evaluate(eval_model, val_loader, stats, device)
+            print(f"epoch {epoch:3d}  train_loss={epoch_loss/n_batches:.5f}  "
+                  f"val_mean_joint_mae={val_metrics['mean_joint_mae']:.5f}  "
+                  f"val_gripper_acc={val_metrics['gripper_accuracy']:.3f}  ({epoch_time:.1f}s)")
+            writer.add_scalar("val/mean_joint_mae", val_metrics["mean_joint_mae"], epoch)
+            writer.add_scalar("val/gripper_accuracy", val_metrics["gripper_accuracy"], epoch)
+            history.append({"epoch": epoch, "train_loss": epoch_loss / n_batches, **val_metrics})
 
-        if val_metrics["mean_joint_mae"] < best_val_mae:
-            best_val_mae = val_metrics["mean_joint_mae"]
-            ckpt = {
-                "model_state_dict": model.state_dict(),
-                "joint_stats": stats,
-                "config": {
-                    "image_size": a.image_size, "num_frames": train_ds.num_frames,
-                    "chunk_len": train_ds.chunk_len, "cameras": ["wrist", "left", "right"],
-                    "cnn_width": a.cnn_width, "d_model": a.d_model, "n_heads": a.n_heads,
-                    "n_encoder_layers": a.n_encoder_layers, "n_decoder_layers": a.n_decoder_layers,
-                },
-                "epoch": epoch,
-                "val_metrics": val_metrics,
-            }
-            torch.save(ckpt, os.path.join(a.out_dir, "best.pt"))
-            print(f"  -> saved new best checkpoint (val_mean_joint_mae={best_val_mae:.5f})")
+            if val_metrics["mean_joint_mae"] < best_val_mae:
+                best_val_mae = val_metrics["mean_joint_mae"]
+                ckpt = {
+                    "model_state_dict": eval_model.state_dict(),
+                    "joint_stats": stats,
+                    "config": {
+                        "image_size": a.image_size, "num_frames": train_ds.num_frames,
+                        "chunk_len": train_ds.chunk_len, "cameras": ["wrist", "left", "right"],
+                        "cnn_width": a.cnn_width, "d_model": a.d_model, "n_heads": a.n_heads,
+                        "n_encoder_layers": a.n_encoder_layers, "n_decoder_layers": a.n_decoder_layers,
+                    },
+                    "epoch": epoch,
+                    "val_metrics": val_metrics,
+                }
+                torch.save(ckpt, os.path.join(a.out_dir, "best.pt"))
+                print(f"  -> saved new best checkpoint (val_mean_joint_mae={best_val_mae:.5f})")
+        if distributed:
+            dist.barrier()
 
-    with open(os.path.join(a.out_dir, "history.json"), "w") as f:
-        json.dump(history, f, indent=2)
-    print("training complete")
+    if is_main:
+        with open(os.path.join(a.out_dir, "history.json"), "w") as f:
+            json.dump(history, f, indent=2)
+        print("training complete")
+    if distributed:
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":
