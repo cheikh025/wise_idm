@@ -27,9 +27,16 @@ def main():
     ckpt = torch.load(a.checkpoint, map_location=DEVICE, weights_only=False)
     cfg = ckpt["config"]
     print(f"checkpoint epoch={ckpt['epoch']} recorded val_metrics={ckpt['val_metrics']}")
+    if cfg.get("use_proprio", False):
+        raise RuntimeError(
+            "This checkpoint was trained with proprioception, which model.py's DroidIDM no longer "
+            "supports at all (removed permanently, project direction). Not loadable via current code -- "
+            "check out an earlier commit (045c0e3 or before) in the wise_idm git history if this "
+            "checkpoint ever needs to be reloaded.")
 
+    cameras = cfg.get("cameras", ["wrist", "left", "right"])
     model = DroidIDM(
-        image_size=cfg["image_size"], num_frames=cfg["num_frames"],
+        image_size=cfg["image_size"], num_frames=cfg["num_frames"], num_cameras=len(cameras),
         cnn_width=cfg.get("cnn_width", 64), d_model=cfg.get("d_model", 256),
         n_heads=cfg.get("n_heads", 8), n_encoder_layers=cfg.get("n_encoder_layers", 4),
         n_decoder_layers=cfg.get("n_decoder_layers", 4),
@@ -40,7 +47,7 @@ def main():
     val_ds = DroidIDMDataset(episode_indices=a.val_episodes, image_size=cfg["image_size"])
     val_loader = DataLoader(val_ds, batch_size=a.batch_size, shuffle=False)
 
-    metrics = evaluate(model, val_loader, ckpt["joint_stats"], DEVICE)
+    metrics = evaluate(model, val_loader, ckpt["joint_stats"], DEVICE, cameras=cameras)
     print(f"reloaded, re-evaluated val_metrics={metrics}")
 
     recorded = ckpt["val_metrics"]

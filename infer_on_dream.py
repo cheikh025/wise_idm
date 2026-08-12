@@ -55,8 +55,14 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     ckpt = torch.load(a.checkpoint, map_location=device, weights_only=False)
     cfg = ckpt["config"]
+    if cfg.get("use_proprio", False):
+        raise RuntimeError(
+            "This checkpoint was trained with proprioception, which model.py's DroidIDM no longer "
+            "supports (removed permanently, project direction). Not loadable via current code -- "
+            "check out an earlier commit (045c0e3 or before) in the wise_idm git history if needed.")
+    cameras = cfg.get("cameras", ["wrist", "left", "right"])
     model = DroidIDM(
-        image_size=cfg["image_size"], num_frames=cfg["num_frames"],
+        image_size=cfg["image_size"], num_frames=cfg["num_frames"], num_cameras=len(cameras),
         cnn_width=cfg.get("cnn_width", 64), d_model=cfg.get("d_model", 256),
         n_heads=cfg.get("n_heads", 8), n_encoder_layers=cfg.get("n_encoder_layers", 4),
         n_decoder_layers=cfg.get("n_decoder_layers", 4),
@@ -68,17 +74,14 @@ def main():
 
     dream = decode_mp4(a.dream)
     print(f"dream video: {dream.shape}")
-    views = split_panel(dream)
-    for k, v in views.items():
+    panel_views = split_panel(dream)
+    for k, v in panel_views.items():
         print(f"  {k}: {v.shape}")
 
-    wrist = resize_stack(views["wrist"], cfg["image_size"]).unsqueeze(0).to(device)
-    left = resize_stack(views["left"], cfg["image_size"]).unsqueeze(0).to(device)
-    right = resize_stack(views["right"], cfg["image_size"]).unsqueeze(0).to(device)
-    proprio = torch.zeros(1, 8, device=device)  # no real proprio available for a pure dream clip
+    views = [resize_stack(panel_views[cam], cfg["image_size"]).unsqueeze(0).to(device) for cam in cameras]
 
     with torch.no_grad():
-        out = model(wrist, left, right, proprio)
+        out = model(views)
         mean = torch.tensor(stats["mean"], device=device)
         std = torch.tensor(stats["std"], device=device)
         joints = (out["joints"] * std + mean)[0].cpu().numpy()  # (32,7) denormalized radians

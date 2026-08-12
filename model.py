@@ -50,6 +50,16 @@ class SmallCNNBackbone(nn.Module):
 
 
 class DroidIDM(nn.Module):
+    """Pure vision -- no proprioception input, ever (explicit, permanent
+    project direction). Predicts actions purely from the imagined/observed
+    video, matching EVA (arXiv:2603.17808) and VPT (arXiv:2206.11795), both
+    of which also use no privileged state input for exactly this class of
+    problem. Note: RUN_0009/RUN_0015's saved checkpoints predate this rule
+    and have proprio_proj weights in their state_dict -- they no longer
+    load through this class; the pre-removal model.py is preserved in git
+    history (commit 045c0e3 and earlier) if ever needed again.
+    """
+
     def __init__(
         self,
         image_size: int = 128,
@@ -61,7 +71,6 @@ class DroidIDM(nn.Module):
         n_encoder_layers: int = 4,
         n_decoder_layers: int = 4,
         action_horizon: int = 32,
-        proprio_dim: int = 8,
         ffn_dim: int = 1024,
         dropout: float = 0.1,
     ):
@@ -82,8 +91,6 @@ class DroidIDM(nn.Module):
         self.camera_embed = nn.Embedding(num_cameras, d_model)
         self.time_embed = nn.Embedding(self.num_pairs, d_model)
         self.spatial_embed = nn.Embedding(self.num_spatial_tokens, d_model)
-
-        self.proprio_proj = nn.Linear(proprio_dim, d_model)
 
         enc_layer = nn.TransformerEncoderLayer(d_model, n_heads, ffn_dim, dropout, batch_first=True)
         self.encoder = nn.TransformerEncoder(enc_layer, n_encoder_layers)
@@ -113,16 +120,12 @@ class DroidIDM(nn.Module):
         tokens = tokens + cam_e + time_e + spat_e
         return tokens.reshape(B, self.num_pairs * self.num_spatial_tokens, -1)
 
-    def forward(self, wrist: torch.Tensor, left: torch.Tensor, right: torch.Tensor,
-                proprio: torch.Tensor) -> dict:
-        B = wrist.shape[0]
-        view_tokens = [
-            self.encode_view(wrist, 0),
-            self.encode_view(left, 1),
-            self.encode_view(right, 2),
-        ]
-        proprio_token = self.proprio_proj(proprio).unsqueeze(1)  # (B, 1, d_model)
-        tokens = torch.cat(view_tokens + [proprio_token], dim=1)
+    def forward(self, views: list[torch.Tensor]) -> dict:
+        """views: list of (B, T, 3, H, W) tensors, one per camera, length must match num_cameras."""
+        assert len(views) == self.num_cameras, f"expected {self.num_cameras} views, got {len(views)}"
+        B = views[0].shape[0]
+        view_tokens = [self.encode_view(v, cam_id) for cam_id, v in enumerate(views)]
+        tokens = torch.cat(view_tokens, dim=1)
 
         context = self.encoder(tokens)
 

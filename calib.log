@@ -1,0 +1,9 @@
+train windows: 4169, val windows: 145, world_size=1
+computing joint normalization stats + gripper pos_weight (parquet-only, no video decode) ...
+mean: [ 0.067  0.496 -0.045 -1.895 -0.103  2.293  0.305]
+std: [0.244 0.473 0.198 0.476 0.451 0.454 0.546]
+gripper pos_weight: 1.046 (pos=65215, neg=68193)
+arch=v2  model params: 9.00M  96 tokens (vs v1's 1536)
+epoch   0  train_loss=1.11028  val_mean_joint_mae=0.20745  val_gripper_acc=0.670  (58.3s)
+  -> saved new best checkpoint (val_mean_joint_mae=0.20745)
+training complete

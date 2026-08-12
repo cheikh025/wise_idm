@@ -87,7 +87,22 @@ class DroidIDMDataset(Dataset):
         self.chunk_len = chunk_len
         self.reader = VideoFrameReader()
 
-        meta = pd.read_parquet(f"{BASE}/meta/episodes/chunk-000/file-000.parquet")
+        # meta/episodes is itself split across multiple parquet files (5 as of
+        # this dataset revision, covering the full 57639-episode range) -- every
+        # prior run here only ever used episode_index < 4999, safely inside
+        # file-000's range (0-14903), so this bug was latent until episode
+        # ranges spanning the full dataset (e.g. a lab-stratified sample) were
+        # used for the first time. Discover and load all parts, not just file-000.
+        from huggingface_hub import hf_hub_download, list_repo_files
+        meta_files = sorted(f for f in list_repo_files("nvidia/Cosmos3-DROID", repo_type="dataset")
+                             if f.startswith("success/meta/episodes/") and f.endswith(".parquet"))
+        meta_parts = []
+        for f in meta_files:
+            local = f"{BASE}/{f.removeprefix('success/')}"
+            if not os.path.exists(local):
+                hf_hub_download("nvidia/Cosmos3-DROID", f, repo_type="dataset")
+            meta_parts.append(pd.read_parquet(local))
+        meta = pd.concat(meta_parts, ignore_index=True)
         self.meta = meta[meta["episode_index"].isin(episode_indices)].set_index("episode_index")
 
         # Episodes beyond ~1216 span multiple DATA parquet files (independent
