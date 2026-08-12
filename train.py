@@ -32,6 +32,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 from droid_dataset import DroidIDMDataset
 from model import DroidIDM
+from model_v2 import DroidIDMv2
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -87,7 +88,13 @@ def loss_fn(joints_pred_norm, gripper_logit_pred, joints_target_norm, gripper_ta
     return joint_loss + gripper_loss, joint_loss.item(), gripper_loss.item()
 
 
-def evaluate(model, loader, stats, device):
+def call_model(model, arch: str, wrist, left, right, proprio):
+    if arch == "v2":
+        return model(wrist, left, right)
+    return model(wrist, left, right, proprio)
+
+
+def evaluate(model, loader, stats, device, arch: str = "v1"):
     model.eval()
     per_joint_abs_err = torch.zeros(7, device=device)
     n = 0
@@ -101,7 +108,7 @@ def evaluate(model, loader, stats, device):
             target = batch["action"].to(device)
             joints_target, gripper_target = target[..., :7], target[..., 7]
 
-            out = model(wrist, left, right, proprio)
+            out = call_model(model, arch, wrist, left, right, proprio)
             joints_pred = denormalize_joints(out["joints"], stats, device)
             gripper_prob = torch.sigmoid(out["gripper_logit"].squeeze(-1))
 
@@ -141,6 +148,10 @@ def main():
     p.add_argument("--n-heads", type=int, default=8)
     p.add_argument("--n-encoder-layers", type=int, default=4)
     p.add_argument("--n-decoder-layers", type=int, default=4)
+    p.add_argument("--arch", choices=["v1", "v2"], default="v1",
+                    help="v1: flatten-to-grid tokens + proprio (original). "
+                         "v2: spatial-softmax token compression, vision-only, no proprio (RUN_0015 redesign).")
+    p.add_argument("--num-keypoints", type=int, default=48, help="v2 only: spatial-softmax keypoints per camera-pair")
     a = p.parse_args()
 
     # Multi-GPU via torchrun: LOCAL_RANK/WORLD_SIZE are set by the launcher,
@@ -170,12 +181,20 @@ def main():
         print("std:", np.round(stats["std"], 3))
         print(f"gripper pos_weight: {pos_weight_val:.3f} (pos={pos}, neg={neg})")
 
-    model = DroidIDM(image_size=a.image_size, num_frames=train_ds.num_frames,
-                      cnn_width=a.cnn_width, d_model=a.d_model, n_heads=a.n_heads,
-                      n_encoder_layers=a.n_encoder_layers, n_decoder_layers=a.n_decoder_layers).to(device)
+    if a.arch == "v2":
+        model = DroidIDMv2(image_size=a.image_size, num_frames=train_ds.num_frames,
+                            cnn_width=a.cnn_width, num_keypoints=a.num_keypoints, d_model=a.d_model,
+                            n_heads=a.n_heads, n_encoder_layers=a.n_encoder_layers,
+                            n_decoder_layers=a.n_decoder_layers).to(device)
+        n_tokens_desc = f"{3 * model.num_pairs} tokens (vs v1's {3 * model.num_pairs * 16})"
+    else:
+        model = DroidIDM(image_size=a.image_size, num_frames=train_ds.num_frames,
+                          cnn_width=a.cnn_width, d_model=a.d_model, n_heads=a.n_heads,
+                          n_encoder_layers=a.n_encoder_layers, n_decoder_layers=a.n_decoder_layers).to(device)
+        n_tokens_desc = f"{model.num_spatial_tokens} spatial tokens/pair"
     n_params = sum(p_.numel() for p_ in model.parameters())
     if is_main:
-        print(f"model params: {n_params/1e6:.2f}M, spatial tokens: {model.num_spatial_tokens}")
+        print(f"arch={a.arch}  model params: {n_params/1e6:.2f}M  {n_tokens_desc}")
     if distributed:
         # Broadcasts rank 0's initial weights to all ranks at construction,
         # then all-reduces gradients each backward() so every rank's
@@ -197,7 +216,7 @@ def main():
         t0 = time.time()
         for step in range(300):
             opt.zero_grad()
-            out = model(wrist, left, right, proprio)
+            out = call_model(model, a.arch, wrist, left, right, proprio)
             joints_pred_norm = out["joints"]
             loss, jl, gl = loss_fn(joints_pred_norm, out["gripper_logit"], joints_target_norm, gripper_target)
             loss.backward()
@@ -250,7 +269,7 @@ def main():
             joints_target_norm = normalize_joints(joints_target, stats, device)
 
             opt.zero_grad()
-            out = model(wrist, left, right, proprio)
+            out = call_model(model, a.arch, wrist, left, right, proprio)
             loss, jl, gl = loss_fn(out["joints"], out["gripper_logit"], joints_target_norm, gripper_target,
                                     gripper_pos_weight=gripper_pos_weight)
             loss.backward()
@@ -270,7 +289,7 @@ def main():
         epoch_time = time.time() - t0
         if is_main:
             eval_model = model.module if distributed else model
-            val_metrics = evaluate(eval_model, val_loader, stats, device)
+            val_metrics = evaluate(eval_model, val_loader, stats, device, arch=a.arch)
             print(f"epoch {epoch:3d}  train_loss={epoch_loss/n_batches:.5f}  "
                   f"val_mean_joint_mae={val_metrics['mean_joint_mae']:.5f}  "
                   f"val_gripper_acc={val_metrics['gripper_accuracy']:.3f}  ({epoch_time:.1f}s)")
@@ -284,10 +303,12 @@ def main():
                     "model_state_dict": eval_model.state_dict(),
                     "joint_stats": stats,
                     "config": {
+                        "arch": a.arch,
                         "image_size": a.image_size, "num_frames": train_ds.num_frames,
                         "chunk_len": train_ds.chunk_len, "cameras": ["wrist", "left", "right"],
                         "cnn_width": a.cnn_width, "d_model": a.d_model, "n_heads": a.n_heads,
                         "n_encoder_layers": a.n_encoder_layers, "n_decoder_layers": a.n_decoder_layers,
+                        "num_keypoints": a.num_keypoints if a.arch == "v2" else None,
                     },
                     "epoch": epoch,
                     "val_metrics": val_metrics,
