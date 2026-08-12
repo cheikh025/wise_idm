@@ -28,7 +28,12 @@ def main():
     cfg = ckpt["config"]
     print(f"checkpoint epoch={ckpt['epoch']} recorded val_metrics={ckpt['val_metrics']}")
 
-    model = DroidIDM(image_size=cfg["image_size"], num_frames=cfg["num_frames"]).to(DEVICE)
+    model = DroidIDM(
+        image_size=cfg["image_size"], num_frames=cfg["num_frames"],
+        cnn_width=cfg.get("cnn_width", 64), d_model=cfg.get("d_model", 256),
+        n_heads=cfg.get("n_heads", 8), n_encoder_layers=cfg.get("n_encoder_layers", 4),
+        n_decoder_layers=cfg.get("n_decoder_layers", 4),
+    ).to(DEVICE)
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
 

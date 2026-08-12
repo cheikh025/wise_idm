@@ -242,6 +242,8 @@ def main():
                 "config": {
                     "image_size": a.image_size, "num_frames": train_ds.num_frames,
                     "chunk_len": train_ds.chunk_len, "cameras": ["wrist", "left", "right"],
+                    "cnn_width": a.cnn_width, "d_model": a.d_model, "n_heads": a.n_heads,
+                    "n_encoder_layers": a.n_encoder_layers, "n_decoder_layers": a.n_decoder_layers,
                 },
                 "epoch": epoch,
                 "val_metrics": val_metrics,
