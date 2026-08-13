@@ -15,7 +15,7 @@ import subprocess
 
 import numpy as np
 import pandas as pd
-from huggingface_hub import hf_hub_download
+from huggingface_hub import hf_hub_download, list_repo_files
 
 BASE = "/workspace/.hf_home/hub/datasets--nvidia--Cosmos3-DROID/snapshots/5c11a20accb11497270a5247a7f1e66ad04c956c/success"
 CACHE_DIR = "/workspace/wise_idm/cache"
@@ -23,14 +23,39 @@ CAMERAS = ["wrist_image_left", "exterior_image_1_left", "exterior_image_2_left"]
 IMAGE_SIZE = 128
 
 
+def load_full_meta() -> pd.DataFrame:
+    """meta/episodes is split across multiple parquet files (5 as of this
+    dataset revision, covering the full ~57.6k-episode range) -- reading only
+    file-000 (covers episodes 0-14903) was a latent bug, never triggered
+    before every prior run used episode_index < 4999. Fixed here too
+    (droid_dataset.py has the same fix, commit 2d0e08f)."""
+    meta_files = sorted(f for f in list_repo_files("nvidia/Cosmos3-DROID", repo_type="dataset")
+                         if f.startswith("success/meta/episodes/") and f.endswith(".parquet"))
+    parts = []
+    for f in meta_files:
+        local = f"{BASE}/{f.removeprefix('success/')}"
+        if not os.path.exists(local):
+            hf_hub_download("nvidia/Cosmos3-DROID", f, repo_type="dataset")
+        parts.append(pd.read_parquet(local))
+    return pd.concat(parts, ignore_index=True)
+
+
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--num-episodes", type=int, default=500)
+    p.add_argument("--num-episodes", type=int, default=None, help="Sequential 0..N-1 (legacy mode).")
+    p.add_argument("--episodes-file", default=None,
+                    help="CSV with an 'episode_index' column -- for a stratified/non-contiguous episode list.")
     a = p.parse_args()
-    episodes = list(range(a.num_episodes))
+    if a.episodes_file:
+        episodes = pd.read_csv(a.episodes_file)["episode_index"].tolist()
+    elif a.num_episodes:
+        episodes = list(range(a.num_episodes))
+    else:
+        raise ValueError("pass one of --num-episodes or --episodes-file")
+    print(f"preprocessing {len(episodes)} episodes")
 
     os.makedirs(CACHE_DIR, exist_ok=True)
-    meta = pd.read_parquet(f"{BASE}/meta/episodes/chunk-000/file-000.parquet")
+    meta = load_full_meta()
     meta = meta[meta["episode_index"].isin(episodes)].set_index("episode_index")
 
     for cam in CAMERAS:

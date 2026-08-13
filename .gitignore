@@ -2,11 +2,9 @@
 __pycache__/
 *.pyc
 cache/
-checkpoints/
-checkpoints_500ep/
-checkpoints_500ep_wide/
-tb_logs/
-tb_logs_500ep/
-tb_logs_500ep_wide/
+checkpoints*/
+tb_logs*/
 *.npy
 *.pt
+*.log
+*.png
