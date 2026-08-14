@@ -1,61 +1,116 @@
-"""M4 training ladder stage 3: checkpoint save/reload verification.
+"""Reload an IDM checkpoint and reproduce its recorded validation metrics."""
+from __future__ import annotations
 
-Loads a saved checkpoint fresh into a new model instance and re-evaluates on
-the val split, confirming the reloaded metrics match what was recorded
-during training (not a new/different model, and no state lost in the
-save/load round trip).
-"""
 import argparse
 
 import torch
 from torch.utils.data import DataLoader
 
-from droid_dataset import DroidIDMDataset
-from model import DroidIDM
-from train import evaluate
+from droid_dataset import DroidIDMDataset, load_episode_manifest
+from model_factory import build_model, canonical_arch, checkpoint_input_geometry
+from model_wise import ARCH_ID, CAMERA_ORDER
+from train import episode_selection_digest, evaluate, manifest_file_digest
 
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--checkpoint", required=True)
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--val-manifest")
+    source.add_argument("--val-episodes", type=int, nargs="+")
+    parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--num-workers", type=int, default=2)
+    args = parser.parse_args()
 
-def main():
-    p = argparse.ArgumentParser()
-    p.add_argument("--checkpoint", required=True)
-    p.add_argument("--val-episodes", type=int, nargs="+", required=True)
-    p.add_argument("--batch-size", type=int, default=16)
-    a = p.parse_args()
-
-    ckpt = torch.load(a.checkpoint, map_location=DEVICE, weights_only=False)
-    cfg = ckpt["config"]
-    print(f"checkpoint epoch={ckpt['epoch']} recorded val_metrics={ckpt['val_metrics']}")
-    if cfg.get("use_proprio", False):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
+    config = checkpoint["config"]
+    print(f"checkpoint epoch={checkpoint['epoch']} recorded val_metrics={checkpoint['val_metrics']}")
+    if config.get("use_proprio", config.get("uses_proprioception", False)):
+        raise RuntimeError("proprioception checkpoints are not supported by the vision-only WISE-IDM")
+    if canonical_arch(config.get("arch")) != ARCH_ID:
         raise RuntimeError(
-            "This checkpoint was trained with proprioception, which model.py's DroidIDM no longer "
-            "supports at all (removed permanently, project direction). Not loadable via current code -- "
-            "check out an earlier commit (045c0e3 or before) in the wise_idm git history if this "
-            "checkpoint ever needs to be reloaded.")
+            "legacy validation caches used a different resize pipeline; this verifier only "
+            "supports wise_resnet50_transformer_v1 checkpoints"
+        )
+    required = {
+        "dataset_repo",
+        "dataset_revision",
+        "train_selection_sha256",
+        "val_selection_sha256",
+        "train_manifest_sha256",
+        "val_manifest_sha256",
+    }
+    missing = sorted(key for key in required if not config.get(key))
+    if missing:
+        raise RuntimeError(
+            "production checkpoint is missing data provenance fields: " + ", ".join(missing)
+        )
 
-    cameras = cfg.get("cameras", ["wrist", "left", "right"])
-    model = DroidIDM(
-        image_size=cfg["image_size"], num_frames=cfg["num_frames"], num_cameras=len(cameras),
-        cnn_width=cfg.get("cnn_width", 64), d_model=cfg.get("d_model", 256),
-        n_heads=cfg.get("n_heads", 8), n_encoder_layers=cfg.get("n_encoder_layers", 4),
-        n_decoder_layers=cfg.get("n_decoder_layers", 4),
-    ).to(DEVICE)
-    model.load_state_dict(ckpt["model_state_dict"])
+    model = build_model(config, load_pretrained_backbone=False).to(device)
+    model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
 
-    val_ds = DroidIDMDataset(episode_indices=a.val_episodes, image_size=cfg["image_size"])
-    val_loader = DataLoader(val_ds, batch_size=a.batch_size, shuffle=False)
-
-    metrics = evaluate(model, val_loader, ckpt["joint_stats"], DEVICE, cameras=cameras)
+    input_height, input_width = checkpoint_input_geometry(config)
+    dataset_args = dict(
+        input_height=input_height,
+        input_width=input_width,
+        num_frames=int(config.get("num_frames", 33)),
+        chunk_len=int(config.get("chunk_len", 32)),
+        stride=int(config.get("val_stride", 32)),
+        end_align_tail=bool(config.get("end_align_tail", True)),
+    )
+    if args.val_manifest:
+        dataset = DroidIDMDataset(
+            episodes=load_episode_manifest(args.val_manifest),
+            **dataset_args,
+        )
+    else:
+        dataset = DroidIDMDataset(
+            episode_indices=args.val_episodes,
+            dataset_split="success",
+            **dataset_args,
+        )
+    expected_selection = config.get("val_selection_sha256")
+    if expected_selection is not None:
+        actual_selection = episode_selection_digest(dataset)
+        if actual_selection != expected_selection:
+            raise ValueError(
+                "validation episode selection does not match the checkpoint fingerprint"
+            )
+    expected_manifest = config.get("val_manifest_sha256")
+    if expected_manifest is not None:
+        if not args.val_manifest:
+            raise ValueError("this checkpoint requires its validation manifest file")
+        if manifest_file_digest(args.val_manifest) != expected_manifest:
+            raise ValueError("validation manifest file does not match the checkpoint fingerprint")
+    loader = DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+    )
+    metrics = evaluate(
+        model,
+        loader,
+        checkpoint["joint_stats"],
+        device,
+        arch=config.get("arch"),
+        cameras=list(config.get("cameras", CAMERA_ORDER)),
+    )
     print(f"reloaded, re-evaluated val_metrics={metrics}")
 
-    recorded = ckpt["val_metrics"]
-    mae_diff = abs(metrics["mean_joint_mae"] - recorded["mean_joint_mae"])
-    acc_diff = abs(metrics["gripper_accuracy"] - recorded["gripper_accuracy"])
-    print(f"\ndiff: joint_mae={mae_diff:.6f}, gripper_acc={acc_diff:.6f}")
-    ok = mae_diff < 1e-4 and acc_diff < 1e-4
-    print("MATCH" if ok else "MISMATCH -- investigate")
+    recorded = checkpoint["val_metrics"]
+    joint_mae_difference = abs(metrics["mean_joint_mae"] - recorded["mean_joint_mae"])
+    gripper_accuracy_difference = abs(metrics["gripper_accuracy"] - recorded["gripper_accuracy"])
+    print(
+        f"\ndiff: joint_mae={joint_mae_difference:.6f}, "
+        f"gripper_acc={gripper_accuracy_difference:.6f}"
+    )
+    matches = joint_mae_difference < 1e-4 and gripper_accuracy_difference < 1e-4
+    print("MATCH" if matches else "MISMATCH -- investigate")
+    if not matches:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

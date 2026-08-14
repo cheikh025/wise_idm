@@ -1,112 +1,273 @@
-"""Decode DROID videos into resized uint8 npy caches, one file per (camera, video-file).
+"""Decode selected Cosmos3-DROID video shards into rectangular RGB caches.
 
-Avoids repeated full-file ffmpeg re-decodes per window (AV1/general video
-codecs decode sequentially; seeking to an arbitrary frame means decoding
-everything before it). Decodes each needed (camera, chunk, file)'s required
-frame prefix exactly once, resizes to IMAGE_SIZE, and caches to disk.
-
-Generalized (vs. the M4 debug-subset version) to span multiple video files
-per camera, since scaling past ~27-66 episodes (the debug-subset's video
-chunking boundary) requires more than one file per camera.
+Every source frame is retained in temporal order. Frames are resized with an
+aspect-preserving letterbox to 224x128 by default; old square caches are not
+reused because their geometry cannot be recovered.
 """
+from __future__ import annotations
+
 import argparse
 import os
 import subprocess
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from huggingface_hub import hf_hub_download, list_repo_files
 
-BASE = "/workspace/.hf_home/hub/datasets--nvidia--Cosmos3-DROID/snapshots/5c11a20accb11497270a5247a7f1e66ad04c956c/success"
-CACHE_DIR = "/workspace/wise_idm/cache"
-CAMERAS = ["wrist_image_left", "exterior_image_1_left", "exterior_image_2_left"]
-IMAGE_SIZE = 128
-
-
-def load_full_meta() -> pd.DataFrame:
-    """meta/episodes is split across multiple parquet files (5 as of this
-    dataset revision, covering the full ~57.6k-episode range) -- reading only
-    file-000 (covers episodes 0-14903) was a latent bug, never triggered
-    before every prior run used episode_index < 4999. Fixed here too
-    (droid_dataset.py has the same fix, commit 2d0e08f)."""
-    meta_files = sorted(f for f in list_repo_files("nvidia/Cosmos3-DROID", repo_type="dataset")
-                         if f.startswith("success/meta/episodes/") and f.endswith(".parquet"))
-    parts = []
-    for f in meta_files:
-        local = f"{BASE}/{f.removeprefix('success/')}"
-        if not os.path.exists(local):
-            hf_hub_download("nvidia/Cosmos3-DROID", f, repo_type="dataset")
-        parts.append(pd.read_parquet(local))
-    return pd.concat(parts, ignore_index=True)
+from droid_dataset import (
+    CAMERAS,
+    DATASET_SPLITS,
+    FPS,
+    EpisodeRef,
+    _local_or_download,
+    _metadata_files,
+    cache_path,
+    load_episode_manifest,
+)
+from vision import DEFAULT_INPUT_HEIGHT, DEFAULT_INPUT_WIDTH
+from vision import letterbox_rgb
 
 
-def main():
-    p = argparse.ArgumentParser()
-    p.add_argument("--num-episodes", type=int, default=None, help="Sequential 0..N-1 (legacy mode).")
-    p.add_argument("--episodes-file", default=None,
-                    help="CSV with an 'episode_index' column -- for a stratified/non-contiguous episode list.")
-    a = p.parse_args()
-    if a.episodes_file:
-        episodes = pd.read_csv(a.episodes_file)["episode_index"].tolist()
-    elif a.num_episodes:
-        episodes = list(range(a.num_episodes))
-    else:
-        raise ValueError("pass one of --num-episodes or --episodes-file")
-    print(f"preprocessing {len(episodes)} episodes")
+RESIZE_BATCH_FRAMES = 256
 
-    os.makedirs(CACHE_DIR, exist_ok=True)
-    meta = load_full_meta()
-    meta = meta[meta["episode_index"].isin(episodes)].set_index("episode_index")
 
-    for cam in CAMERAS:
-        chunk_col = f"videos/observation.image.{cam}/chunk_index"
-        file_col = f"videos/observation.image.{cam}/file_index"
-        to_ts_col = f"videos/observation.image.{cam}/to_timestamp"
-
-        needed = meta.groupby([chunk_col, file_col])[to_ts_col].max()
-        print(f"{cam}: {len(needed)} video file(s) needed")
-
-        for (chunk, file), max_to_ts in needed.items():
-            chunk, file = int(chunk), int(file)
-            out_path = os.path.join(CACHE_DIR, f"{cam}_chunk{chunk:03d}_file{file:03d}.npy")
-            n_frames_needed = int(round(max_to_ts * 15.0)) + 2
-
-            if os.path.exists(out_path):
-                arr = np.load(out_path, mmap_mode="r")
-                if arr.shape[0] >= n_frames_needed:
-                    print(f"  {cam} chunk{chunk} file{file}: cached ({arr.shape[0]} frames), skipping")
-                    continue
-
-            rel = f"success/videos/observation.image.{cam}/chunk-{chunk:03d}/file-{file:03d}.mp4"
-            print(f"  {cam} chunk{chunk} file{file}: downloading {rel} ...")
-            local_path = hf_hub_download("nvidia/Cosmos3-DROID", rel, repo_type="dataset")
-
-            print(f"  {cam} chunk{chunk} file{file}: decoding {n_frames_needed} frames ...")
-            cmd = [
-                "ffmpeg", "-v", "error", "-i", local_path,
-                "-vframes", str(n_frames_needed),
-                "-vf", f"scale={IMAGE_SIZE}:{IMAGE_SIZE}",
-                "-f", "rawvideo", "-pix_fmt", "rgb24", "-",
+def load_split_metadata(dataset_split: str) -> pd.DataFrame:
+    columns = [
+        "episode_index",
+        "episode_id",
+        "length",
+        "dataset_from_index",
+        "dataset_to_index",
+    ]
+    for camera in CAMERAS:
+        columns.extend(
+            [
+                f"videos/observation.image.{camera}/chunk_index",
+                f"videos/observation.image.{camera}/file_index",
+                f"videos/observation.image.{camera}/from_timestamp",
+                f"videos/observation.image.{camera}/to_timestamp",
             ]
-            result = subprocess.run(cmd, capture_output=True, check=True)
-            raw = result.stdout
-            frame_bytes = IMAGE_SIZE * IMAGE_SIZE * 3
-            n = len(raw) // frame_bytes
-            frames = np.frombuffer(raw, dtype=np.uint8).reshape(n, IMAGE_SIZE, IMAGE_SIZE, 3)
-            # Write to a temp file then atomically rename into place. np.save()
-            # writing directly to out_path would truncate/overwrite the SAME
-            # inode in place if the file already exists -- fatal if another
-            # process (e.g. a concurrent training run) has that file mmap'd
-            # open, since its pages would be invalidated mid-read (observed:
-            # SIGBUS crash in train.py when this preprocessing script re-decoded
-            # a wider frame range for the same cache file a training run had
-            # open). os.replace() is atomic on the same filesystem and leaves
-            # any existing mmap safely pointing at the old (unlinked) inode.
-            tmp_path = out_path + ".tmp"
-            with open(tmp_path, "wb") as f:  # explicit handle: np.save() appends ".npy" if given a bare path string
-                np.save(f, frames)
-            os.replace(tmp_path, out_path)
-            print(f"  {cam} chunk{chunk} file{file}: saved {frames.shape} ({frames.nbytes/1e6:.1f} MB)")
+        )
+    return pd.concat(
+        [pd.read_parquet(path, columns=columns) for path in _metadata_files(dataset_split)],
+        ignore_index=True,
+    )
+
+
+def _read_at_most(stream, requested_bytes: int) -> bytes:
+    """Fill a raw-video batch unless the stream reaches EOF."""
+    chunks = []
+    remaining = requested_bytes
+    while remaining:
+        chunk = stream.read(remaining)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def decode_resized_video(
+    video_path: str,
+    output_path: Path,
+    frames_needed: int,
+    input_height: int,
+    input_width: int,
+) -> tuple[int, int, int, int]:
+    probe = subprocess.run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=width,height",
+            "-of",
+            "csv=p=0",
+            video_path,
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    source_width, source_height = (int(value) for value in probe.stdout.strip().split(","))
+    command = [
+        "ffmpeg",
+        "-v",
+        "error",
+        "-i",
+        video_path,
+        "-vframes",
+        str(frames_needed),
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "rgb24",
+        "-",
+    ]
+
+    temporary_path = Path(str(output_path) + ".tmp")
+    output = np.lib.format.open_memmap(
+        temporary_path,
+        mode="w+",
+        dtype=np.uint8,
+        shape=(frames_needed, input_height, input_width, 3),
+    )
+    frame_bytes = source_height * source_width * 3
+    decoded = 0
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    assert process.stdout is not None
+    try:
+        while decoded < frames_needed:
+            batch_count = min(RESIZE_BATCH_FRAMES, frames_needed - decoded)
+            requested_bytes = batch_count * frame_bytes
+            raw = _read_at_most(process.stdout, requested_bytes)
+            complete_frames = len(raw) // frame_bytes
+            if complete_frames == 0:
+                break
+            if len(raw) % frame_bytes:
+                raise RuntimeError(
+                    f"ffmpeg returned a partial raw frame ({len(raw)} bytes, frame size {frame_bytes})"
+                )
+            frames = np.frombuffer(raw, dtype=np.uint8).reshape(
+                complete_frames, source_height, source_width, 3
+            )
+            output[decoded : decoded + complete_frames] = letterbox_rgb(
+                frames, input_height, input_width
+            )
+            decoded += complete_frames
+        if decoded != frames_needed:
+            raise RuntimeError(
+                f"decoded only {decoded}/{frames_needed} requested frames from {video_path}"
+            )
+        process.stdout.close()
+        assert process.stderr is not None
+        stderr = process.stderr.read().decode("utf-8", errors="replace")
+        returncode = process.wait()
+        if returncode:
+            raise subprocess.CalledProcessError(returncode, command, stderr=stderr)
+        output.flush()
+        output._mmap.close()
+        output = None
+        os.replace(temporary_path, output_path)
+    except BaseException:
+        process.kill()
+        process.wait()
+        if output is not None:
+            output._mmap.close()
+        temporary_path.unlink(missing_ok=True)
+        raise
+    return frames_needed, input_height, input_width, 3
+
+
+def selected_episodes(args: argparse.Namespace) -> list[EpisodeRef]:
+    if args.manifest:
+        return load_episode_manifest(args.manifest)
+    if args.episodes_file:
+        frame = pd.read_csv(args.episodes_file)
+        if "dataset_split" in frame:
+            return [
+                EpisodeRef(str(row.dataset_split), int(row.episode_index))
+                for row in frame.itertuples(index=False)
+            ]
+        return [EpisodeRef(args.dataset_split, int(value)) for value in frame["episode_index"]]
+    if args.num_episodes is not None:
+        return [EpisodeRef(args.dataset_split, index) for index in range(args.num_episodes)]
+    raise ValueError("pass exactly one of --manifest, --episodes-file, or --num-episodes")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--manifest", help="CSV with dataset_split and episode_index columns")
+    source.add_argument("--episodes-file", help="Legacy CSV with at least episode_index")
+    source.add_argument("--num-episodes", type=int, help="Legacy sequential 0..N-1 mode")
+    parser.add_argument("--dataset-split", choices=DATASET_SPLITS, default="success")
+    parser.add_argument("--input-height", type=int, default=DEFAULT_INPUT_HEIGHT)
+    parser.add_argument("--input-width", type=int, default=DEFAULT_INPUT_WIDTH)
+    args = parser.parse_args()
+    if args.input_height <= 0 or args.input_width <= 0:
+        raise ValueError("input dimensions must be positive")
+
+    episodes = selected_episodes(args)
+    if len({ref.key for ref in episodes}) != len(episodes):
+        raise ValueError("episode selection contains duplicate split/index keys")
+    print(f"preprocessing {len(episodes)} episodes at {args.input_width}x{args.input_height}")
+
+    grouped = {
+        split: [ref.episode_index for ref in episodes if ref.dataset_split == split]
+        for split in DATASET_SPLITS
+    }
+    for dataset_split, episode_indices in grouped.items():
+        if not episode_indices:
+            continue
+        metadata = load_split_metadata(dataset_split)
+        metadata = metadata[metadata["episode_index"].isin(episode_indices)].set_index("episode_index")
+        if metadata.index.has_duplicates:
+            raise ValueError(f"{dataset_split} metadata contains duplicate episode indices")
+        missing = set(episode_indices) - set(metadata.index.astype(int))
+        if missing:
+            raise KeyError(f"{dataset_split} metadata is missing episodes: {sorted(missing)[:20]}")
+
+        for camera in CAMERAS:
+            chunk_col = f"videos/observation.image.{camera}/chunk_index"
+            file_col = f"videos/observation.image.{camera}/file_index"
+            from_timestamp_col = f"videos/observation.image.{camera}/from_timestamp"
+            to_timestamp_col = f"videos/observation.image.{camera}/to_timestamp"
+            requirements = metadata[
+                [chunk_col, file_col, from_timestamp_col, to_timestamp_col, "length"]
+            ].copy()
+            requirements["start_frame"] = (
+                requirements[from_timestamp_col].astype(float).mul(FPS).round().astype(int)
+            )
+            requirements["exclusive_end_frame"] = (
+                requirements[to_timestamp_col].astype(float).mul(FPS).round().astype(int)
+            )
+            duration = requirements["exclusive_end_frame"] - requirements["start_frame"]
+            invalid = (
+                (requirements["start_frame"] < 0)
+                | (duration != requirements["length"].astype(int))
+            )
+            if invalid.any():
+                bad = requirements.loc[invalid].head()
+                raise ValueError(
+                    f"{dataset_split}/{camera} contains timestamp ranges inconsistent "
+                    f"with episode length:\n{bad}"
+                )
+            needed = requirements.groupby([chunk_col, file_col])["exclusive_end_frame"].max()
+            print(f"{dataset_split}/{camera}: {len(needed)} video shard(s)")
+
+            for (chunk, file_index), exclusive_end_frame in needed.items():
+                chunk, file_index = int(chunk), int(file_index)
+                output_path = cache_path(
+                    dataset_split,
+                    camera,
+                    chunk,
+                    file_index,
+                    args.input_height,
+                    args.input_width,
+                )
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                frames_needed = int(exclusive_end_frame)
+
+                if output_path.exists():
+                    cached = np.load(output_path, mmap_mode="r")
+                    expected_tail = (args.input_height, args.input_width, 3)
+                    if cached.ndim == 4 and tuple(cached.shape[1:]) == expected_tail and len(cached) >= frames_needed:
+                        print(f"  chunk{chunk} file{file_index}: cached ({len(cached)} frames), skipping")
+                        continue
+
+                relative = f"videos/observation.image.{camera}/chunk-{chunk:03d}/file-{file_index:03d}.mp4"
+                local_video = _local_or_download(dataset_split, relative)
+                shape = decode_resized_video(
+                    local_video,
+                    output_path,
+                    frames_needed,
+                    args.input_height,
+                    args.input_width,
+                )
+                print(f"  chunk{chunk} file{file_index}: saved {shape}")
 
     print("done")
 

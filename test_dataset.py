@@ -2,7 +2,12 @@ from droid_dataset import DroidIDMDataset
 import time
 
 t0 = time.time()
-ds = DroidIDMDataset(episode_indices=list(range(27)), image_size=128)
+ds = DroidIDMDataset(
+    episode_indices=list(range(27)),
+    input_height=128,
+    input_width=224,
+    stride=16,
+)
 print(f"dataset built in {time.time()-t0:.2f}s, {len(ds)} windows from 27 episodes")
 
 t0 = time.time()
@@ -18,4 +23,4 @@ for k, v in sample.items():
 sample2 = ds[len(ds) // 2]
 print(f"\nmid-dataset sample: episode={sample2['episode_index']} chunk_start={sample2['chunk_start']}")
 print(f"  action shape: {tuple(sample2['action'].shape)}")
-print(f"  proprio: {sample2['proprio']}")
+print(f"  dataset split: {sample2['dataset_split']}")
