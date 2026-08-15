@@ -7,9 +7,16 @@ import torch
 from torch.utils.data import DataLoader
 
 from droid_dataset import DroidIDMDataset, load_episode_manifest
-from model_factory import build_model, canonical_arch, checkpoint_input_geometry
+from droid_panel_dataset import DroidIDMPanelDataset
+from model_composite import ARCH_ID as COMPOSITE_ARCH_ID
+from model_factory import (
+    build_model,
+    canonical_arch,
+    checkpoint_input_geometry,
+    configure_backends,
+)
 from model_wise import ARCH_ID, CAMERA_ORDER
-from train import episode_selection_digest, evaluate, manifest_file_digest
+from train import batch_view_keys, episode_selection_digest, evaluate, manifest_file_digest
 
 
 def main() -> None:
@@ -22,16 +29,18 @@ def main() -> None:
     parser.add_argument("--num-workers", type=int, default=2)
     args = parser.parse_args()
 
+    configure_backends()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
     config = checkpoint["config"]
     print(f"checkpoint epoch={checkpoint['epoch']} recorded val_metrics={checkpoint['val_metrics']}")
     if config.get("use_proprio", config.get("uses_proprioception", False)):
         raise RuntimeError("proprioception checkpoints are not supported by the vision-only WISE-IDM")
-    if canonical_arch(config.get("arch")) != ARCH_ID:
+    arch = canonical_arch(config.get("arch"))
+    if arch not in (ARCH_ID, COMPOSITE_ARCH_ID):
         raise RuntimeError(
             "legacy validation caches used a different resize pipeline; this verifier only "
-            "supports wise_resnet50_transformer_v1 checkpoints"
+            f"supports {ARCH_ID} and {COMPOSITE_ARCH_ID} checkpoints"
         )
     required = {
         "dataset_repo",
@@ -49,28 +58,39 @@ def main() -> None:
 
     model = build_model(config, load_pretrained_backbone=False).to(device)
     model.load_state_dict(checkpoint["model_state_dict"])
+    if device.type == "cuda":
+        model = model.to(memory_format=torch.channels_last)
     model.eval()
 
-    input_height, input_width = checkpoint_input_geometry(config)
-    dataset_args = dict(
-        input_height=input_height,
-        input_width=input_width,
-        num_frames=int(config.get("num_frames", 33)),
-        chunk_len=int(config.get("chunk_len", 32)),
-        stride=int(config.get("val_stride", 32)),
-        end_align_tail=bool(config.get("end_align_tail", True)),
-    )
-    if args.val_manifest:
-        dataset = DroidIDMDataset(
+    if arch == COMPOSITE_ARCH_ID:
+        if not args.val_manifest:
+            raise RuntimeError(f"{COMPOSITE_ARCH_ID} checkpoints require --val-manifest")
+        dataset = DroidIDMPanelDataset(
             episodes=load_episode_manifest(args.val_manifest),
-            **dataset_args,
+            stride=int(config.get("val_stride", 32)),
+            end_align_tail=bool(config.get("end_align_tail", True)),
         )
     else:
-        dataset = DroidIDMDataset(
-            episode_indices=args.val_episodes,
-            dataset_split="success",
-            **dataset_args,
+        input_height, input_width = checkpoint_input_geometry(config)
+        dataset_args = dict(
+            input_height=input_height,
+            input_width=input_width,
+            num_frames=int(config.get("num_frames", 33)),
+            chunk_len=int(config.get("chunk_len", 32)),
+            stride=int(config.get("val_stride", 32)),
+            end_align_tail=bool(config.get("end_align_tail", True)),
         )
+        if args.val_manifest:
+            dataset = DroidIDMDataset(
+                episodes=load_episode_manifest(args.val_manifest),
+                **dataset_args,
+            )
+        else:
+            dataset = DroidIDMDataset(
+                episode_indices=args.val_episodes,
+                dataset_split="success",
+                **dataset_args,
+            )
     expected_selection = config.get("val_selection_sha256")
     if expected_selection is not None:
         actual_selection = episode_selection_digest(dataset)
@@ -96,7 +116,7 @@ def main() -> None:
         checkpoint["joint_stats"],
         device,
         arch=config.get("arch"),
-        cameras=list(config.get("cameras", CAMERA_ORDER)),
+        cameras=batch_view_keys(arch),
     )
     print(f"reloaded, re-evaluated val_metrics={metrics}")
 

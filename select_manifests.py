@@ -1,3 +1,4 @@
+
 """Create the frozen 21K train and 1K validation episode manifests.
 
 The input catalog is the official Cosmos3-DROID episode metadata joined to

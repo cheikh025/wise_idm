@@ -149,8 +149,14 @@ def _manifest_frame(refs: Sequence[EpisodeRef], path: str) -> pd.DataFrame:
     )
     if not (frame["scene_key"].astype(str).str.strip() == expected_scene_keys).all():
         raise ValueError(f"production manifest {path} contains an inconsistent scene_key")
-    if frame["uuid"].astype(str).duplicated().any():
-        raise ValueError(f"production manifest {path} contains duplicate raw UUIDs")
+    if frame["episode_id"].astype(str).duplicated().any():
+        raise ValueError(f"production manifest {path} contains duplicate episode_id values")
+    # Raw DROID uuids omit the outcome, so 41 uuids appear once under the
+    # success root and once under the failure root for genuinely different
+    # episodes (different lengths, different video shards). Episode identity is
+    # split-qualified everywhere else, so qualify the uuid check the same way.
+    if frame[["dataset_split", "uuid"]].astype(str).duplicated().any():
+        raise ValueError(f"production manifest {path} contains duplicate split-qualified raw UUIDs")
     numeric_length = pd.to_numeric(frame["length"], errors="coerce")
     if numeric_length.isna().any() or (numeric_length < MIN_EPISODE_FRAMES).any():
         raise ValueError(

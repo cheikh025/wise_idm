@@ -1,6 +1,0 @@
-train windows: 47430, val windows: 8865
-computing joint normalization stats from train split ...
-mean: [ 0.075  0.349 -0.004 -1.998 -0.055  2.349  0.198]
-std: [0.206 0.405 0.175 0.421 0.316 0.365 0.599]
-model params: 23.82M, spatial tokens: 16
-gripper pos_weight: 1.143 (pos=708318, neg=809442)

@@ -26,7 +26,16 @@ from droid_dataset import (
     assert_scene_disjoint,
     load_episode_manifest,
 )
-from model_factory import build_model, canonical_arch, forward_model
+from droid_panel_dataset import (
+    PANEL_LAYOUT_VERSION as COMPOSITE_PANEL_LAYOUT_VERSION,
+)
+from droid_panel_dataset import (
+    PANEL_TARGET_HEIGHT,
+    PANEL_TARGET_WIDTH,
+    DroidIDMPanelDataset,
+)
+from model_composite import ARCH_ID as COMPOSITE_ARCH_ID
+from model_factory import build_model, canonical_arch, configure_backends, forward_model
 from model_wise import ARCH_ID, BACKBONE_WEIGHTS, CAMERA_ORDER
 from selection import (
     TRAIN_EPISODES,
@@ -42,6 +51,11 @@ from vision import (
     PANEL_LAYOUT_VERSION,
     VISION_PREPROCESS_VERSION,
 )
+
+
+def batch_view_keys(arch: str) -> list[str]:
+    """Which batch dict keys `call_model` reads, for the given architecture."""
+    return ["panel"] if canonical_arch(arch) == COMPOSITE_ARCH_ID else list(CAMERA_ORDER)
 
 
 def compute_stats_fast(dataset: DroidIDMDataset) -> tuple[dict, float, int, int]:
@@ -75,15 +89,35 @@ def compute_stats_fast(dataset: DroidIDMDataset) -> tuple[dict, float, int, int]
     )
 
 
+_STATS_TENSORS: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
+
+
+def stats_tensors(stats: dict, device, dtype) -> tuple[torch.Tensor, torch.Tensor]:
+    """Device-resident joint mean/std, built once per (stats, device, dtype).
+
+    Rebuilding these from Python lists on every micro-batch costs a pageable
+    host-to-device copy, and a pageable copy blocks the host until everything
+    already queued on the stream has finished - which stalls CPU run-ahead and
+    stops the next batch's transfer overlapping with compute.
+    """
+    key = (tuple(stats["mean"]), tuple(stats["std"]), str(device), dtype)
+    cached = _STATS_TENSORS.get(key)
+    if cached is None:
+        cached = (
+            torch.as_tensor(stats["mean"], device=device, dtype=dtype),
+            torch.as_tensor(stats["std"], device=device, dtype=dtype),
+        )
+        _STATS_TENSORS[key] = cached
+    return cached
+
+
 def normalize_joints(joints: torch.Tensor, stats: dict, device) -> torch.Tensor:
-    mean = torch.as_tensor(stats["mean"], device=device, dtype=joints.dtype)
-    std = torch.as_tensor(stats["std"], device=device, dtype=joints.dtype)
+    mean, std = stats_tensors(stats, device, joints.dtype)
     return (joints - mean) / std
 
 
 def denormalize_joints(joints: torch.Tensor, stats: dict, device) -> torch.Tensor:
-    mean = torch.as_tensor(stats["mean"], device=device, dtype=joints.dtype)
-    std = torch.as_tensor(stats["std"], device=device, dtype=joints.dtype)
+    mean, std = stats_tensors(stats, device, joints.dtype)
     return joints * std + mean
 
 
@@ -93,18 +127,32 @@ def loss_fn(
     joints_target_norm: torch.Tensor,
     gripper_target: torch.Tensor,
     gripper_pos_weight: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, float, float]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     joint_loss = F.smooth_l1_loss(joints_pred_norm, joints_target_norm)
     gripper_loss = F.binary_cross_entropy_with_logits(
         gripper_logit_pred.squeeze(-1),
         gripper_target,
         pos_weight=gripper_pos_weight,
     )
-    return joint_loss + gripper_loss, joint_loss.item(), gripper_loss.item()
+    return joint_loss + gripper_loss, joint_loss.detach(), gripper_loss.detach()
+
+
+def prepare_view(frames: torch.Tensor, device) -> torch.Tensor:
+    """Move one camera clip to ``device`` as float (B, T, 3, H, W) in [0, 1].
+
+    The dataset hands over uint8 ``(B, T, H, W, 3)`` so that the host->device
+    copy carries a quarter of the bytes; the permute and 1/255 scaling are the
+    same arithmetic the CPU path used to do, just executed on the GPU. Float
+    inputs (dream inference, tests) are passed through untouched.
+    """
+    tensor = frames.to(device, non_blocking=True)
+    if tensor.dtype == torch.uint8:
+        tensor = tensor.permute(0, 1, 4, 2, 3).float().div_(255.0)
+    return tensor
 
 
 def call_model(model, arch: str, batch: dict, device, cameras: list[str]):
-    views = [batch[camera].to(device, non_blocking=True) for camera in cameras]
+    views = [prepare_view(batch[camera], device) for camera in cameras]
     return forward_model(model, arch, views)
 
 
@@ -123,11 +171,14 @@ def evaluate(
     cameras: list[str] = CAMERA_ORDER,
     amp_dtype: torch.dtype | None = None,
     distributed: bool = False,
+    max_batches: int = 0,
 ) -> dict:
     model.eval()
     totals = torch.zeros(11, device=device, dtype=torch.float64)
     with torch.no_grad():
-        for batch in loader:
+        for batch_index, batch in enumerate(loader):
+            if max_batches and batch_index >= max_batches:
+                break
             target = batch["action"].to(device, non_blocking=True)
             joints_target, gripper_target = target[..., :7], target[..., 7]
             with amp_context(device, amp_dtype):
@@ -157,10 +208,11 @@ def evaluate(
     }
 
 
-def build_datasets(args: argparse.Namespace) -> tuple[DroidIDMDataset, DroidIDMDataset]:
+def build_datasets(args: argparse.Namespace):
     if bool(args.train_manifest) != bool(args.val_manifest):
         raise ValueError("--train-manifest and --val-manifest must be provided together")
 
+    arch = canonical_arch(args.arch)
     common = dict(
         input_height=args.input_height,
         input_width=args.input_width,
@@ -172,7 +224,10 @@ def build_datasets(args: argparse.Namespace) -> tuple[DroidIDMDataset, DroidIDMD
         train_refs = load_episode_manifest(args.train_manifest, require_scene_id=True)
         val_refs = load_episode_manifest(args.val_manifest, require_scene_id=True)
         assert_scene_disjoint(train_refs, val_refs)
-        if args.mode == "train":
+        if args.mode == "train" and args.nonproduction_manifests:
+            args.train_selection_audit = None
+            args.val_selection_audit = None
+        elif args.mode == "train":
             args.train_selection_audit = validate_production_manifest(
                 train_refs,
                 args.train_manifest,
@@ -185,8 +240,14 @@ def build_datasets(args: argparse.Namespace) -> tuple[DroidIDMDataset, DroidIDMD
                 expected_count=VAL_EPISODES,
                 lab_outcome_quotas=VAL_LAB_OUTCOME_QUOTAS,
             )
-        train_dataset = DroidIDMDataset(episodes=train_refs, stride=args.train_stride, **common)
-        val_dataset = DroidIDMDataset(episodes=val_refs, stride=args.val_stride, **common)
+        if arch == COMPOSITE_ARCH_ID:
+            train_dataset = DroidIDMPanelDataset(episodes=train_refs, stride=args.train_stride)
+            val_dataset = DroidIDMPanelDataset(episodes=val_refs, stride=args.val_stride)
+        else:
+            train_dataset = DroidIDMDataset(episodes=train_refs, stride=args.train_stride, **common)
+            val_dataset = DroidIDMDataset(episodes=val_refs, stride=args.val_stride, **common)
+    elif arch == COMPOSITE_ARCH_ID:
+        raise ValueError(f"{COMPOSITE_ARCH_ID} requires --train-manifest and --val-manifest")
     else:
         train_dataset = DroidIDMDataset(
             episode_indices=args.train_episodes,
@@ -256,7 +317,9 @@ def checkpoint_config(
             "exterior_image_1_left",
             "exterior_image_2_left",
         ],
-        "panel_layout_version": PANEL_LAYOUT_VERSION,
+        "panel_layout_version": (
+            COMPOSITE_PANEL_LAYOUT_VERSION if arch == COMPOSITE_ARCH_ID else PANEL_LAYOUT_VERSION
+        ),
         "vision_preprocess_version": VISION_PREPROCESS_VERSION,
         "dataset_repo": HF_REPO,
         "dataset_revision": HF_REVISION,
@@ -280,7 +343,13 @@ def checkpoint_config(
         "batch_size_per_rank": args.batch_size,
         "gradient_accumulation": args.gradient_accumulation,
         "world_size": world_size,
+        "effective_batch_size": args.batch_size * args.gradient_accumulation * world_size,
         "amp_dtype": args.amp_dtype,
+        "train_drop_last": True,
+        "memory_format": "channels_last",
+        "limit_train_batches": args.limit_train_batches,
+        "limit_val_batches": args.limit_val_batches,
+        "nonproduction_manifests": args.nonproduction_manifests,
         "train_selection_audit": getattr(args, "train_selection_audit", None),
         "val_selection_audit": getattr(args, "val_selection_audit", None),
         "train_window_audit": window_audit(train_dataset, args.train_manifest),
@@ -296,6 +365,24 @@ def checkpoint_config(
                 "d_model": args.d_model,
                 "n_heads": args.n_heads,
                 "cross_view_layers": args.cross_view_layers,
+                "temporal_layers": args.temporal_layers,
+                "ffn_dim": args.ffn_dim,
+                "dropout": args.dropout,
+            }
+        )
+    elif arch == COMPOSITE_ARCH_ID:
+        config.update(
+            {
+                "backbone": "resnet50_layer3",
+                "backbone_weights": None if args.no_pretrained_backbone else BACKBONE_WEIGHTS,
+                "backbone_input_channels": 6,
+                "panel_height": PANEL_TARGET_HEIGHT,
+                "panel_width": PANEL_TARGET_WIDTH,
+                "compressed_channels": args.compressed_channels,
+                "pool_height": args.pool_height,
+                "pool_width": args.pool_width,
+                "d_model": args.d_model,
+                "n_heads": args.n_heads,
                 "temporal_layers": args.temporal_layers,
                 "ffn_dim": args.ffn_dim,
                 "dropout": args.dropout,
@@ -334,9 +421,19 @@ def capture_rng_state() -> dict:
 def restore_rng_state(state: dict) -> None:
     random.setstate(state["python"])
     np.random.set_state(state["numpy"])
-    torch.set_rng_state(state["torch"])
+    # torch.load(..., map_location=device) moves every tensor in the
+    # checkpoint onto that device, including this CPU-only RNG state buried
+    # inside a plain dict - but torch.set_rng_state() requires a CPU tensor
+    # specifically (verified: a CUDA-resident uint8 tensor raises "RNG state
+    # must be a torch.ByteTensor" even though the dtype matches). The CUDA RNG
+    # states below need no such fix - torch.cuda.get_rng_state_all() already
+    # returns one CPU-side snapshot tensor per GPU, and set_rng_state_all
+    # itself handles placing each back on its own device.
+    torch.set_rng_state(state["torch"].cpu())
     if state.get("cuda") is not None and torch.cuda.is_available():
-        torch.cuda.set_rng_state_all(state["cuda"])
+        # Each per-GPU snapshot from torch.cuda.get_rng_state_all() is also a
+        # CPU-side tensor internally (same map_location hazard as above).
+        torch.cuda.set_rng_state_all([tensor.cpu() for tensor in state["cuda"]])
 
 
 def gather_rng_states(distributed: bool, world_size: int, is_main: bool) -> list[dict] | None:
@@ -363,14 +460,49 @@ def main() -> None:
     parser.add_argument("--gradient-accumulation", type=int, default=8)
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--num-workers", type=int, default=8, help="dataloader workers per rank")
+    parser.add_argument("--prefetch-factor", type=int, default=4)
+    parser.add_argument("--val-batch-size", type=int, default=None, help="defaults to --batch-size")
+    parser.add_argument("--log-interval", type=int, default=25, help="micro-batches between scalar logs")
+    parser.add_argument(
+        "--limit-train-batches",
+        type=int,
+        default=0,
+        help="smoke test only: stop each epoch after this many micro-batches (0 = full epoch). "
+        "Recorded in the checkpoint config, so a limited run can never be mistaken for, "
+        "or resumed into, the production run.",
+    )
+    parser.add_argument(
+        "--limit-val-batches", type=int, default=0, help="smoke test only: cap validation batches"
+    )
+    parser.add_argument(
+        "--nonproduction-manifests",
+        action="store_true",
+        help="probes only: skip the frozen 21K/1K lab x outcome quota check so a small "
+        "subset manifest can be used. Recorded in the checkpoint config, so such a "
+        "checkpoint can never be mistaken for, or resumed into, the production run. "
+        "Scene disjointness is still enforced.",
+    )
+    parser.add_argument(
+        "--compile",
+        action="store_true",
+        help="torch.compile the model (about 1.35x faster; adds a one-off warmup)",
+    )
+    parser.add_argument(
+        "--compile-mode",
+        choices=("default", "max-autotune", "max-autotune-no-cudagraphs", "reduce-overhead"),
+        default="default",
+        help="torch.compile mode; max-autotune trades a longer one-off compile for faster kernels",
+    )
     parser.add_argument("--out-dir", default="/workspace/wise_idm/checkpoints")
     parser.add_argument("--log-dir", default="/workspace/wise_idm/tb_logs")
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--arch", choices=("wise", ARCH_ID, "v1", "v2"), default=ARCH_ID)
+    parser.add_argument(
+        "--arch", choices=("wise", ARCH_ID, "composite", COMPOSITE_ARCH_ID, "v1", "v2"), default=ARCH_ID
+    )
     parser.add_argument("--d-model", type=int, default=512)
     parser.add_argument("--n-heads", type=int, default=8)
-    parser.add_argument("--cross-view-layers", type=int, default=2)
+    parser.add_argument("--cross-view-layers", type=int, default=2, help="wise (3-view) architecture only")
     parser.add_argument("--temporal-layers", type=int, default=6)
     parser.add_argument("--ffn-dim", type=int, default=2048)
     parser.add_argument("--dropout", type=float, default=0.1)
@@ -378,6 +510,9 @@ def main() -> None:
     parser.add_argument("--n-encoder-layers", type=int, default=4, help="legacy architectures only")
     parser.add_argument("--n-decoder-layers", type=int, default=4, help="legacy architectures only")
     parser.add_argument("--num-keypoints", type=int, default=48, help="legacy v2 only")
+    parser.add_argument("--compressed-channels", type=int, default=256, help="composite architecture only")
+    parser.add_argument("--pool-height", type=int, default=8, help="composite architecture only")
+    parser.add_argument("--pool-width", type=int, default=10, help="composite architecture only")
     parser.add_argument("--amp-dtype", choices=("bf16", "fp16", "none"), default="bf16")
     parser.add_argument("--resume", help="resume from a last.pt training checkpoint")
     parser.add_argument("--no-pretrained-backbone", action="store_true")
@@ -395,12 +530,13 @@ def main() -> None:
     if arch in ("v1", "v2") and args.input_height != args.input_width:
         raise ValueError("legacy architectures require square input dimensions")
 
+    configure_backends()
     world_size = int(os.environ.get("WORLD_SIZE", 1))
     distributed = world_size > 1
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     if distributed:
-        dist.init_process_group(backend="nccl")
         torch.cuda.set_device(local_rank)
+        dist.init_process_group(backend="nccl", device_id=torch.device(f"cuda:{local_rank}"))
     device = torch.device(f"cuda:{local_rank}") if torch.cuda.is_available() else torch.device("cpu")
     if device.type == "cuda" and args.amp_dtype == "bf16" and not torch.cuda.is_bf16_supported():
         raise RuntimeError("--amp-dtype bf16 requires a CUDA device with native BF16 support")
@@ -447,7 +583,7 @@ def main() -> None:
         ):
             raise ValueError("resume checkpoint train-action statistics do not match this dataset")
     load_pretrained_backbone = (
-        arch == ARCH_ID
+        arch in (ARCH_ID, COMPOSITE_ARCH_ID)
         and resume_payload is None
         and not args.no_pretrained_backbone
     )
@@ -463,9 +599,23 @@ def main() -> None:
         model.load_state_dict(resume_payload["model_state_dict"])
     parameter_count = sum(parameter.numel() for parameter in model.parameters())
     if is_main:
-        print(f"arch={arch}, parameters={parameter_count / 1e6:.2f}M, cameras={CAMERA_ORDER}")
+        print(f"arch={arch}, parameters={parameter_count / 1e6:.2f}M, batch_keys={batch_view_keys(arch)}")
+    # NHWC convolutions are ~1.5x faster for this backbone on A100 and change
+    # only the kernel layout, not the arithmetic the checkpoint encodes.
+    if device.type == "cuda":
+        model = model.to(memory_format=torch.channels_last)
+    # ``unwrapped`` stays the plain module: checkpoints and evaluation use it,
+    # so state_dict keys never gain a DDP/compile wrapper prefix.
+    unwrapped = model
     if distributed:
-        model = DistributedDataParallel(model, device_ids=[local_rank])
+        model = DistributedDataParallel(
+            model, device_ids=[local_rank], gradient_as_bucket_view=True
+        )
+    step_model = (
+        torch.compile(model, mode=None if args.compile_mode == "default" else args.compile_mode)
+        if args.compile
+        else model
+    )
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     positive_weight = (
@@ -489,7 +639,7 @@ def main() -> None:
         model.train()
         for step in range(300):
             optimizer.zero_grad(set_to_none=True)
-            output = call_model(model, arch, batch, device, list(CAMERA_ORDER))
+            output = call_model(step_model, arch, batch, device, batch_view_keys(arch))
             loss, joint_loss, gripper_loss = loss_fn(
                 output["joints"], output["gripper_logit"], joints_target_norm, gripper_target
             )
@@ -503,8 +653,8 @@ def main() -> None:
                     ((gripper_probability > 0.5) == (gripper_target > 0.5)).float().mean().item()
                 )
                 print(
-                    f"step {step:4d} loss={loss.item():.5f} joint_loss={joint_loss:.5f} "
-                    f"gripper_bce={gripper_loss:.5f} joint_mae={joint_mae:.5f} "
+                    f"step {step:4d} loss={loss.item():.5f} joint_loss={joint_loss.item():.5f} "
+                    f"gripper_bce={gripper_loss.item():.5f} joint_mae={joint_mae:.5f} "
                     f"gripper_acc={gripper_accuracy:.3f} ({time.time() - started:.1f}s)"
                 )
         if writer:
@@ -514,31 +664,38 @@ def main() -> None:
         return
 
     train_sampler = DistributedSampler(train_dataset, shuffle=True, seed=args.seed) if distributed else None
-    loader_kwargs = dict(
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-        pin_memory=device.type == "cuda",
-        persistent_workers=args.num_workers > 0,
-    )
+    prefetch = {"prefetch_factor": args.prefetch_factor} if args.num_workers > 0 else {}
     train_loader = DataLoader(
         train_dataset,
         sampler=train_sampler,
         shuffle=train_sampler is None,
-        **loader_kwargs,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        pin_memory=device.type == "cuda",
+        persistent_workers=args.num_workers > 0,
+        drop_last=True,
+        **prefetch,
     )
     rank = dist.get_rank() if distributed else 0
     val_rank_indices = list(range(rank, len(val_dataset), world_size))
     val_subset = torch.utils.data.Subset(val_dataset, val_rank_indices)
+    val_workers = max(1, args.num_workers // 2) if args.num_workers > 0 else 0
     val_loader = DataLoader(
         val_subset,
-        batch_size=args.batch_size,
+        batch_size=args.val_batch_size or args.batch_size,
         shuffle=False,
-        num_workers=min(2, args.num_workers),
+        num_workers=val_workers,
         pin_memory=device.type == "cuda",
-        persistent_workers=args.num_workers > 0,
+        persistent_workers=val_workers > 0,
+        **({"prefetch_factor": args.prefetch_factor} if val_workers > 0 else {}),
     )
 
-    optimizer_steps_per_epoch = math.ceil(len(train_loader) / args.gradient_accumulation)
+    batches_per_epoch = len(train_loader)
+    if args.limit_train_batches:
+        batches_per_epoch = min(batches_per_epoch, args.limit_train_batches)
+    if batches_per_epoch == 0:
+        raise ValueError("the training loader yields no batches; lower --batch-size")
+    optimizer_steps_per_epoch = math.ceil(batches_per_epoch / args.gradient_accumulation)
     total_steps = args.epochs * optimizer_steps_per_epoch
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer,
@@ -570,15 +727,21 @@ def main() -> None:
     for epoch in range(start_epoch, args.epochs):
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
-        model.train()
+        unwrapped.train()
         optimizer.zero_grad(set_to_none=True)
         started = time.time()
-        epoch_loss = 0.0
+        # Accumulated on the GPU: reading these every micro-batch would force a
+        # host sync and stall the input pipeline.
+        running = torch.zeros(3, device=device, dtype=torch.float64)
         batch_count = 0
+        windows_seen = 0
+        last_report = started
 
         for batch_index, batch in enumerate(train_loader):
+            if batch_index >= batches_per_epoch:
+                break
             group_start = (batch_index // args.gradient_accumulation) * args.gradient_accumulation
-            group_size = min(args.gradient_accumulation, len(train_loader) - group_start)
+            group_size = min(args.gradient_accumulation, batches_per_epoch - group_start)
             should_step = batch_index + 1 == group_start + group_size
             target = batch["action"].to(device, non_blocking=True)
             joints_target, gripper_target = target[..., :7], target[..., 7]
@@ -586,7 +749,7 @@ def main() -> None:
             sync_context = nullcontext() if should_step or not distributed else model.no_sync()
             with sync_context:
                 with amp_context(device, amp_dtype):
-                    output = call_model(model, arch, batch, device, list(CAMERA_ORDER))
+                    output = call_model(step_model, arch, batch, device, batch_view_keys(arch))
                     loss, joint_loss, gripper_loss = loss_fn(
                         output["joints"],
                         output["gripper_logit"],
@@ -606,15 +769,29 @@ def main() -> None:
                 scheduler.step()
                 global_step += 1
 
-            epoch_loss += loss.item()
+            running += torch.stack((loss.detach().double(), joint_loss.double(), gripper_loss.double()))
             batch_count += 1
-            if writer:
+            windows_seen += target.shape[0]
+            if writer and batch_index % args.log_interval == 0:
                 writer.add_scalar("train/loss", loss.item(), global_step)
-                writer.add_scalar("train/joint_loss", joint_loss, global_step)
-                writer.add_scalar("train/gripper_bce", gripper_loss, global_step)
+                writer.add_scalar("train/joint_loss", joint_loss.item(), global_step)
+                writer.add_scalar("train/gripper_bce", gripper_loss.item(), global_step)
                 writer.add_scalar("train/lr", scheduler.get_last_lr()[0], global_step)
+            if is_main and batch_index and batch_index % (args.log_interval * 20) == 0:
+                now = time.time()
+                rate = args.log_interval * 20 * args.batch_size / (now - last_report)
+                last_report = now
+                print(
+                    f"  epoch {epoch} batch {batch_index}/{batches_per_epoch} "
+                    f"loss={loss.item():.5f} {rate:.1f} win/s/rank "
+                    f"({rate * world_size:.1f} win/s total) "
+                    f"mem={torch.cuda.max_memory_allocated() / 2**30:.1f} GiB",
+                    flush=True,
+                )
+                if writer:
+                    writer.add_scalar("throughput/windows_per_second_total", rate * world_size, global_step)
 
-        evaluation_model = model.module if distributed else model
+        evaluation_model = unwrapped
         if distributed:
             for buffer in evaluation_model.buffers():
                 dist.broadcast(buffer, src=0)
@@ -624,27 +801,45 @@ def main() -> None:
             stats,
             device,
             arch=arch,
-            cameras=list(CAMERA_ORDER),
+            cameras=batch_view_keys(arch),
             amp_dtype=None,
             distributed=distributed,
+            max_batches=args.limit_val_batches,
         )
-        train_totals = torch.tensor(
-            [epoch_loss, batch_count], device=device, dtype=torch.float64
+        train_totals = torch.cat(
+            (running, torch.tensor([batch_count, windows_seen], device=device, dtype=torch.float64))
         )
         if distributed:
             dist.all_reduce(train_totals, op=dist.ReduceOp.SUM)
-        mean_train_loss = (train_totals[0] / train_totals[1]).item()
+        mean_train_loss = (train_totals[0] / train_totals[3]).item()
+        mean_joint_loss = (train_totals[1] / train_totals[3]).item()
+        mean_gripper_loss = (train_totals[2] / train_totals[3]).item()
         rng_states = gather_rng_states(distributed, world_size, is_main)
         if is_main:
             elapsed = time.time() - started
             print(
                 f"epoch {epoch:3d} train_loss={mean_train_loss:.5f} "
                 f"val_mean_joint_mae={metrics['mean_joint_mae']:.5f} "
-                f"val_gripper_acc={metrics['gripper_accuracy']:.3f} ({elapsed:.1f}s)"
+                f"val_gripper_acc={metrics['gripper_accuracy']:.3f} "
+                f"({elapsed:.1f}s, {train_totals[4].item() / elapsed:.1f} win/s)",
+                flush=True,
             )
             writer.add_scalar("val/mean_joint_mae", metrics["mean_joint_mae"], epoch)
             writer.add_scalar("val/gripper_accuracy", metrics["gripper_accuracy"], epoch)
-            history.append({"epoch": epoch, "train_loss": mean_train_loss, **metrics})
+            writer.add_scalar("val/gripper_mae", metrics["gripper_mae"], epoch)
+            writer.add_scalar("train/epoch_loss", mean_train_loss, epoch)
+            writer.add_scalar("train/epoch_seconds", elapsed, epoch)
+            history.append(
+                {
+                    "epoch": epoch,
+                    "train_loss": mean_train_loss,
+                    "train_joint_loss": mean_joint_loss,
+                    "train_gripper_loss": mean_gripper_loss,
+                    "epoch_seconds": elapsed,
+                    "train_windows": int(train_totals[4].item()),
+                    **metrics,
+                }
+            )
 
             improved = metrics["mean_joint_mae"] < best_val_mae
             if improved:

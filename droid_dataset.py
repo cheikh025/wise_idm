@@ -7,6 +7,7 @@ identity is always the pair ``(dataset_split, episode_index)``.
 """
 from __future__ import annotations
 
+import json
 import os
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -150,6 +151,20 @@ def cache_path(
     )
 
 
+def ranges_path(
+    dataset_split: str,
+    camera: str,
+    chunk: int,
+    file_index: int,
+    input_height: int,
+    input_width: int,
+) -> Path:
+    """Sidecar recording which absolute frame ranges a cache file really holds."""
+    return cache_path(
+        dataset_split, camera, chunk, file_index, input_height, input_width
+    ).with_suffix(".ranges.json")
+
+
 def window_starts(
     length: int,
     *,
@@ -208,7 +223,9 @@ class VideoFrameReader:
         self.max_open_files = max_open_files
         self._arrays: OrderedDict[tuple, np.ndarray] = OrderedDict()
 
-    def _get(self, dataset_split: str, camera: str, chunk: int, file_index: int) -> np.ndarray:
+    def _get(
+        self, dataset_split: str, camera: str, chunk: int, file_index: int
+    ) -> tuple[np.ndarray, list[list[int]] | None]:
         key = (dataset_split, camera, chunk, file_index)
         if key in self._arrays:
             self._arrays.move_to_end(key)
@@ -232,10 +249,18 @@ class VideoFrameReader:
                     f"cache {path} has shape {array.shape}; expected (N, {expected_tail}). "
                     "Old square caches cannot be reused."
                 )
-            self._arrays[key] = array
+            sidecar = ranges_path(
+                dataset_split, camera, chunk, file_index, self.input_height, self.input_width
+            )
+            # Caches written by preprocess_videos.py only materialise the frames
+            # the selected episodes own; everything else is a hole in a sparse
+            # file. The sidecar makes an unwritten read an error rather than a
+            # silent block of black pixels. Legacy dense caches have no sidecar.
+            written = json.loads(sidecar.read_text(encoding="ascii"))["ranges"] if sidecar.exists() else None
+            self._arrays[key] = (array, written)
             while len(self._arrays) > self.max_open_files:
                 _, oldest = self._arrays.popitem(last=False)
-                mmap = getattr(oldest, "_mmap", None)
+                mmap = getattr(oldest[0], "_mmap", None)
                 if mmap is not None:
                     mmap.close()
         return self._arrays[key]
@@ -246,20 +271,31 @@ class VideoFrameReader:
         camera: str,
         chunk: int,
         file_index: int,
-        frame_indices: Sequence[int],
+        start: int,
+        count: int,
     ) -> np.ndarray:
-        array = self._get(dataset_split, camera, chunk, file_index)
-        if not frame_indices:
-            raise ValueError("frame_indices cannot be empty")
-        if min(frame_indices) < 0 or max(frame_indices) >= len(array):
+        """Return ``count`` consecutive cached frames beginning at ``start``."""
+        array, written = self._get(dataset_split, camera, chunk, file_index)
+        if count <= 0:
+            raise ValueError("count must be positive")
+        stop = start + count
+        if start < 0 or stop > len(array):
             raise IndexError(
-                f"requested frames [{min(frame_indices)}, {max(frame_indices)}] "
-                f"from cache with {len(array)} frames"
+                f"requested frames [{start}, {stop}) from cache with {len(array)} frames"
             )
-        return np.stack([array[index] for index in frame_indices])
+        if written is not None and not any(
+            block[0] <= start and stop <= block[1] for block in written
+        ):
+            raise IndexError(
+                f"cache {dataset_split}/{camera}/chunk{chunk:03d}/file{file_index:03d} does not "
+                f"hold frames [{start}, {stop}); run preprocess_videos.py for this manifest"
+            )
+        # Copy inside the worker so the page-fault I/O happens here rather than
+        # lazily in the collate/pin path of the training process.
+        return np.array(array[start:stop])
 
     def close(self) -> None:
-        for array in self._arrays.values():
+        for array, _ in self._arrays.values():
             mmap = getattr(array, "_mmap", None)
             if mmap is not None:
                 mmap.close()
@@ -478,13 +514,23 @@ class DroidIDMDataset(Dataset):
             if missing:
                 raise KeyError(f"{split} data files are missing episodes: {sorted(missing)[:20]}")
 
-        self.video_frame_offset: dict[tuple[str, int], dict[str, int]] = {}
+        # Plain-Python shard locators keep pandas out of ``__getitem__``:
+        # (chunk_index, file_index, first in-file frame index) per camera.
+        self.video_locator: dict[tuple[str, int], dict[str, tuple[int, int, int]]] = {}
         for ref in refs:
             row = self.meta[ref.key]
-            self.video_frame_offset[ref.key] = {
-                camera: round(float(row[f"videos/observation.image.{camera}/from_timestamp"]) * FPS)
+            self.video_locator[ref.key] = {
+                camera: (
+                    int(row[f"videos/observation.image.{camera}/chunk_index"]),
+                    int(row[f"videos/observation.image.{camera}/file_index"]),
+                    round(float(row[f"videos/observation.image.{camera}/from_timestamp"]) * FPS),
+                )
                 for camera in CAMERAS
             }
+        self.video_frame_offset = {
+            key: {camera: locator[2] for camera, locator in cameras.items()}
+            for key, cameras in self.video_locator.items()
+        }
 
         self.windows: list[Window] = []
         self.zero_window_episodes: list[tuple[str, int]] = []
@@ -507,23 +553,22 @@ class DroidIDMDataset(Dataset):
     def __getitem__(self, index: int) -> dict:
         window = self.windows[index]
         key = window.episode_key
-        frame_ids = np.arange(window.chunk_start, window.chunk_start + self.num_frames)
 
         views: dict[str, torch.Tensor] = {}
-        row = self.meta[key]
         for camera in CAMERAS:
-            offset = self.video_frame_offset[key][camera]
-            file_frame_ids = (frame_ids + offset).tolist()
-            chunk = int(row[f"videos/observation.image.{camera}/chunk_index"])
-            file_index = int(row[f"videos/observation.image.{camera}/file_index"])
+            chunk, file_index, offset = self.video_locator[key][camera]
             frames = self.reader.read_frames(
                 window.dataset_split,
                 camera,
                 chunk,
                 file_index,
-                file_frame_ids,
+                window.chunk_start + offset,
+                self.num_frames,
             )
-            views[camera] = torch.from_numpy(frames.copy()).permute(0, 3, 1, 2).float().div_(255.0)
+            # uint8 (T, H, W, 3). The permute/scale to float (T, 3, H, W) in
+            # [0, 1] happens on the GPU: it is the same arithmetic, but moves
+            # 4x fewer bytes over PCIe and off the dataloader workers.
+            views[camera] = torch.from_numpy(frames)
 
         joints, gripper = self.episode_actions[key]
         action_slice = slice(window.chunk_start, window.chunk_start + self.chunk_len)

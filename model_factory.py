@@ -7,9 +7,23 @@ import torch
 import torch.nn as nn
 
 from model import DroidIDM
+from model_composite import ARCH_ID as COMPOSITE_ARCH_ID
+from model_composite import CompositeIDM
 from model_v2 import DroidIDMv2
 from model_wise import ARCH_ID, CAMERA_ORDER, WiseIDM
-from vision import PANEL_LAYOUT_VERSION, VISION_PREPROCESS_VERSION
+from vision import PANEL_HEIGHT, PANEL_LAYOUT_VERSION, PANEL_WIDTH, VISION_PREPROCESS_VERSION
+
+
+def configure_backends() -> None:
+    """Backend settings shared by training, verification, and inference.
+
+    ``cudnn.benchmark`` only picks faster kernels for the fixed input shapes
+    this model always uses, and ``channels_last`` (applied by the callers to
+    the module) is a layout change, not a precision change. TF32 flags are
+    deliberately left at their PyTorch defaults so that a checkpoint's
+    validation metric reproduces under ``verify_checkpoint.py``.
+    """
+    torch.backends.cudnn.benchmark = True
 
 
 def canonical_arch(arch: str | None) -> str:
@@ -19,6 +33,8 @@ def canonical_arch(arch: str | None) -> str:
         return "v2"
     if arch in ("wise", ARCH_ID):
         return ARCH_ID
+    if arch in ("composite", COMPOSITE_ARCH_ID):
+        return COMPOSITE_ARCH_ID
     raise ValueError(f"unknown IDM architecture: {arch}")
 
 
@@ -62,6 +78,25 @@ def build_model(config: Mapping, *, load_pretrained_backbone: bool = False) -> n
             pretrained_backbone=load_pretrained_backbone,
         )
 
+    if arch == COMPOSITE_ARCH_ID:
+        if "panel_layout_version" not in config:
+            raise ValueError(f"{COMPOSITE_ARCH_ID} config is missing panel_layout_version")
+        return CompositeIDM(
+            panel_height=int(config.get("panel_height", PANEL_HEIGHT)),
+            panel_width=int(config.get("panel_width", PANEL_WIDTH)),
+            num_frames=int(config.get("num_frames", 33)),
+            action_horizon=int(config.get("action_horizon", config.get("chunk_len", 32))),
+            compressed_channels=int(config.get("compressed_channels", 256)),
+            pool_height=int(config.get("pool_height", 8)),
+            pool_width=int(config.get("pool_width", 10)),
+            d_model=int(config.get("d_model", 512)),
+            n_heads=int(config.get("n_heads", 8)),
+            temporal_layers=int(config.get("temporal_layers", 6)),
+            ffn_dim=int(config.get("ffn_dim", 2048)),
+            dropout=float(config.get("dropout", 0.1)),
+            pretrained_backbone=load_pretrained_backbone,
+        )
+
     image_size = int(config.get("image_size", 128))
     cameras = list(config.get("cameras", ("wrist", "left", "right")))
     common = dict(
@@ -90,7 +125,10 @@ def forward_model(
 
 
 def checkpoint_input_geometry(config: Mapping) -> tuple[int, int]:
-    if canonical_arch(config.get("arch")) == ARCH_ID:
+    arch = canonical_arch(config.get("arch"))
+    if arch == ARCH_ID:
         return int(config.get("input_height", 128)), int(config.get("input_width", 224))
+    if arch == COMPOSITE_ARCH_ID:
+        return int(config.get("panel_height", PANEL_HEIGHT)), int(config.get("panel_width", PANEL_WIDTH))
     size = int(config.get("image_size", 128))
     return size, size
